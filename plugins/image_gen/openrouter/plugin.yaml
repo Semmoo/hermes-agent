@@ -1,0 +1,7 @@
+name: openrouter
+version: 1.0.0
+description: "OpenRouter image generation backend. Uses OPENROUTER_API_KEY and image-output models via Chat Completions."
+author: local
+kind: backend
+requires_env:
+  - OPENROUTER_API_KEY

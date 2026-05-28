@@ -896,6 +896,47 @@ class TestCodexStreamCallbacks:
         assert response is fallback_response
         mock_fallback.assert_called_once_with({}, client=mock_client)
 
+    def test_codex_noniterable_sdk_stream_falls_back_to_create_stream(self):
+        from run_agent import AIAgent
+
+        fallback_response = SimpleNamespace(
+            output=[SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="fallback from raw stream")],
+            )],
+            status="completed",
+        )
+
+        class _BrokenStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __iter__(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        mock_client = MagicMock()
+        mock_client.responses.stream.return_value = _BrokenStream()
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.5",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        with patch.object(agent, "_run_codex_create_stream_fallback", return_value=fallback_response) as mock_fallback:
+            response = agent._run_codex_stream({}, client=mock_client)
+
+        assert response is fallback_response
+        mock_fallback.assert_called_once_with({}, client=mock_client)
+
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 
@@ -914,14 +955,17 @@ class TestCodexStreamCallbacks:
 
         events = [
             SimpleNamespace(type="response.output_text.delta", delta="Hello"),
-            SimpleNamespace(type="response.output_item.done", item=SimpleNamespace(type="message")),
+            SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text="Hello")],
+                ),
+            ),
             SimpleNamespace(
                 type="response.completed",
                 response=SimpleNamespace(
-                    output=[SimpleNamespace(
-                        type="message",
-                        content=[SimpleNamespace(type="output_text", text="Hello")],
-                    )]
+                    output=None,
                 ),
             ),
         ]
@@ -938,12 +982,14 @@ class TestCodexStreamCallbacks:
         mock_client = MagicMock()
         mock_client.responses.create.return_value = mock_stream
 
-        agent._run_codex_create_stream_fallback(
+        response = agent._run_codex_create_stream_fallback(
             {"model": "test/model", "instructions": "hi", "input": []},
             client=mock_client,
         )
 
         assert touch_calls.count("receiving stream response") == len(events)
+        assert isinstance(response.output, list)
+        assert response.output[0].content[0].text == "Hello"
 
 
 class TestAnthropicStreamCallbacks:

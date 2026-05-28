@@ -2113,6 +2113,54 @@ class TestCodexAdapterReasoningTranslation:
         assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
         assert captured.get("include") == ["reasoning.encrypted_content"]
 
+    def test_noniterable_sdk_stream_falls_back_to_raw_create_stream(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        class _BrokenStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __iter__(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        terminal = SimpleNamespace(
+            output=None,
+            usage=SimpleNamespace(input_tokens=1, output_tokens=2, total_tokens=3),
+        )
+
+        class _RawCreateStream:
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(
+                        type="response.output_item.done",
+                        item=SimpleNamespace(
+                            type="message",
+                            content=[SimpleNamespace(type="output_text", text="raw fallback text")],
+                        ),
+                    ),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=terminal,
+                    )
+                ])
+
+            def close(self):
+                return None
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _BrokenStream()
+        real_client.responses.create.return_value = _RawCreateStream()
+
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        response = adapter.create(messages=[{"role": "user", "content": "hi"}])
+
+        assert response.choices[0].message.content == "raw fallback text"
+        assert response.usage.total_tokens == 3
+        real_client.responses.create.assert_called_once()
+
     def test_reasoning_effort_minimal_clamped_to_low(self):
         """Codex backend rejects 'minimal'; adapter clamps to 'low' per main transport."""
         adapter, captured = self._build_adapter()

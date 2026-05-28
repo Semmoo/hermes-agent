@@ -784,6 +784,84 @@ class _CodexCompletionsAdapter:
                 # new failure mode for auxiliary calls.
                 pass
 
+        def _backfill_final_response(final: Any, collected_output_items: List[Any], collected_text_deltas: List[str], has_function_calls: bool) -> Any:
+            _output = getattr(final, "output", None)
+            if not isinstance(_output, list) or not _output:
+                if collected_output_items:
+                    final.output = list(collected_output_items)
+                    logger.debug(
+                        "Codex auxiliary: backfilled %d output items from stream events",
+                        len(collected_output_items),
+                    )
+                elif collected_text_deltas and not has_function_calls:
+                    assembled = "".join(collected_text_deltas)
+                    final.output = [SimpleNamespace(
+                        type="message", role="assistant", status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )]
+                    logger.debug(
+                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
+                        len(collected_text_deltas), len(assembled),
+                    )
+            return final
+
+        def _raw_create_stream_fallback() -> Any:
+            fallback_kwargs = dict(resp_kwargs)
+            fallback_kwargs["stream"] = True
+            stream_or_response = self._client.responses.create(**fallback_kwargs)
+            if hasattr(stream_or_response, "output"):
+                return stream_or_response
+            if not hasattr(stream_or_response, "__iter__"):
+                return stream_or_response
+
+            terminal_response = None
+            collected_output_items: List[Any] = []
+            collected_text_deltas: List[str] = []
+            has_function_calls = False
+
+            def _event_get(obj: Any, key: str, default: Any = None) -> Any:
+                val = getattr(obj, key, None)
+                if val is None and isinstance(obj, dict):
+                    val = obj.get(key, default)
+                return val if val is not None else default
+
+            try:
+                for _event in stream_or_response:
+                    _check_cancelled()
+                    _etype = _event_get(_event, "type", "")
+                    if _etype == "error":
+                        raise RuntimeError(str(_event_get(_event, "message", "stream emitted error event")))
+                    if _etype == "response.output_item.done":
+                        _done = _event_get(_event, "item")
+                        if _done is not None:
+                            collected_output_items.append(_done)
+                    elif "output_text.delta" in _etype:
+                        _delta = _event_get(_event, "delta", "")
+                        if _delta:
+                            collected_text_deltas.append(_delta)
+                    elif "function_call" in _etype:
+                        has_function_calls = True
+                    if _etype not in {"response.completed", "response.incomplete", "response.failed"}:
+                        continue
+                    terminal_response = _event_get(_event, "response")
+                    if terminal_response is not None:
+                        return _backfill_final_response(
+                            terminal_response,
+                            collected_output_items,
+                            collected_text_deltas,
+                            has_function_calls,
+                        )
+            finally:
+                close_fn = getattr(stream_or_response, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+            if terminal_response is not None:
+                return terminal_response
+            raise RuntimeError("Codex auxiliary create(stream=True) fallback did not emit a terminal response.")
+
         try:
             # Collect output items and text deltas during streaming —
             # the Codex backend can return empty response.output from
@@ -814,27 +892,12 @@ class _CodexCompletionsAdapter:
                 final = stream.get_final_response()
 
             # Backfill empty output from collected stream events
-            _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
-                if collected_output_items:
-                    final.output = list(collected_output_items)
-                    logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
-                        len(collected_output_items),
-                    )
-                elif collected_text_deltas and not has_function_calls:
-                    # Only synthesize text when no tool calls were streamed —
-                    # a function_call response with incidental text should not
-                    # be collapsed into a plain-text message.
-                    assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
-                    logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
-                    )
+            final = _backfill_final_response(
+                final,
+                collected_output_items,
+                collected_text_deltas,
+                has_function_calls,
+            )
 
             # Extract text and tool calls from the Responses output.
             # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
@@ -872,8 +935,47 @@ class _CodexCompletionsAdapter:
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
+            if isinstance(exc, TypeError) and "'NoneType' object is not iterable" in str(exc):
+                logger.debug(
+                    "Codex auxiliary Responses SDK stream iterator was None; "
+                    "falling back to create(stream=True)."
+                )
+                final = _raw_create_stream_fallback()
+
+                def _item_get(obj: Any, key: str, default: Any = None) -> Any:
+                    val = getattr(obj, key, None)
+                    if val is None and isinstance(obj, dict):
+                        val = obj.get(key, default)
+                    return val if val is not None else default
+
+                for item in getattr(final, "output", []):
+                    item_type = _item_get(item, "type")
+                    if item_type == "message":
+                        for part in (_item_get(item, "content") or []):
+                            ptype = _item_get(part, "type")
+                            if ptype in {"output_text", "text"}:
+                                text_parts.append(_item_get(part, "text", ""))
+                    elif item_type == "function_call":
+                        tool_calls_raw.append(SimpleNamespace(
+                            id=_item_get(item, "call_id", ""),
+                            type="function",
+                            function=SimpleNamespace(
+                                name=_item_get(item, "name", ""),
+                                arguments=_item_get(item, "arguments", "{}"),
+                            ),
+                        ))
+
+                resp_usage = getattr(final, "usage", None)
+                if resp_usage:
+                    usage = SimpleNamespace(
+                        prompt_tokens=getattr(resp_usage, "input_tokens", 0),
+                        completion_tokens=getattr(resp_usage, "output_tokens", 0),
+                        total_tokens=getattr(resp_usage, "total_tokens", 0),
+                    )
+                exc = None
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
-            raise
+            if exc is not None:
+                raise
         finally:
             if timeout_timer is not None:
                 timeout_timer.cancel()

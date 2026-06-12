@@ -1755,6 +1755,31 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+
+        # Cron jobs should report a failed scheduled run once, not burn the
+        # normal interactive API retry budget inside the same schedule tick.
+        # Keep interactive/default agent behavior unchanged. Operators can
+        # override with cron.api_max_retries or HERMES_CRON_API_MAX_RETRIES.
+        _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
+        _raw_cron_api_retries = (
+            os.getenv("HERMES_CRON_API_MAX_RETRIES")
+            or _cron_cfg.get("api_max_retries")
+            or _cron_cfg.get("agent_api_max_retries")
+            or 1
+        )
+        try:
+            _cron_api_retries = max(int(_raw_cron_api_retries), 1)
+        except (TypeError, ValueError):
+            _cron_api_retries = 1
+        _old_api_retries = getattr(agent, "_api_max_retries", None)
+        agent._api_max_retries = _cron_api_retries
+        if _old_api_retries != _cron_api_retries:
+            logger.info(
+                "Job '%s': cron API max retries set to %s (agent default was %s)",
+                job_id,
+                _cron_api_retries,
+                _old_api_retries,
+            )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
